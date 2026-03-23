@@ -1,0 +1,533 @@
+name: audience_segments
+description: >
+  JustWatch audience segmentation v5. 307K users from Germany (Dec 2025)
+  classified into 6 named behavioral segments plus Explorer catch-all.
+  Scoring uses log1p-normalized counts, soft gates, and hard gates.
+  Named segments: Binge Watcher, Premium Buyer, Deal Hunter, Watchlist Hoarder,
+  Genre Loyalist, Trailer Scout (new in v5).
+  Marketing names: Devoted Viewer, Premium Buyer, Savvy Streamer,
+  Content Curator, Niche Devotee, Trailer Scout, Open Browser (Explorer).
+  Use this to answer B2B targeting questions for studios and streaming services.
+
+tables:
+  - name: user_segments
+    description: >
+      One row per user. Contains behavioral features, multi-label scores,
+      primary segment, optional secondary segment, and primary_driver explanation.
+      v5 adds two new sharp segments:
+      Trailer Scout (14.8%): research-phase users with high trailer_plays and zero seenlist —
+        avg 4.6 trailer views, 77% movie-focused, low clickout — consideration-stage audience.
+      Premium Buyer (8.0%): TVOD-preferring clickout users — avg buyer_ratio=78.8%,
+        avg free_ratio=11.6% — highest commercial value, opposite of Deal Hunter.
+      Explorer drops from 61.2% (v4) to 45.4% with new segments.
+    base_table:
+      database: DB_TEAM_2
+      schema: BASE_MARTS
+      table: user_segments_v5
+    dimensions:
+      - name: primary_segment
+        synonyms:
+          - segment
+          - audience type
+          - user group
+          - audience segment
+          - viewer category
+          - main segment
+        description: >
+          Primary audience segment. One of 7 values.
+          Binge Watcher (3.5%): deep content consumption, avg seenlist=18.1.
+          Premium Buyer (8.0%): TVOD clickout users, avg buyer_ratio=79%, 100% has_clickout.
+          Deal Hunter (7.7%): free/AVOD seekers, avg free_ratio=77%, 100% has_clickout.
+          Watchlist Hoarder (12.1%): large watchlist relative to consumption.
+          Genre Loyalist (8.6%): 70%+ activity in top 2 genres, min 3 genres.
+          Trailer Scout (14.8%): research-phase, trailer_plays>=3, seenlist=0.
+          Explorer (45.4%): all others below 0.40 threshold.
+          Scored with log1p normalization; hard gates for Loyalist and Trailer Scout.
+        expr: primary_segment
+        data_type: TEXT
+        sample_values:
+          - Binge Watcher
+          - Premium Buyer
+          - Deal Hunter
+          - Watchlist Hoarder
+          - Genre Loyalist
+          - Trailer Scout
+          - Explorer
+
+      - name: secondary_segment
+        synonyms:
+          - overlap segment
+          - dual segment
+          - secondary audience
+        description: >
+          Optional second segment for users who score near two segments
+          (second score >= 0.30, within 0.15 of primary).
+          NULL for most users. Quantifies segment overlap.
+        expr: secondary_segment
+        data_type: TEXT
+
+      - name: primary_driver
+        synonyms:
+          - top signal
+          - main driver
+          - why this segment
+          - driving feature
+          - classification reason
+        description: >
+          The single feature component that most strongly drove the user's
+          primary segment assignment. Explains *why* a user was classified.
+          Values by segment —
+          Binge Watcher: deep_seenlist | long_sessions | logged_in | show_focus;
+          Deal Hunter: free_content_seeker | high_clickout | tvod_buyer;
+          Watchlist Hoarder: large_watchlist | logged_in_hoarder | low_consumption;
+          Genre Loyalist: genre_concentrated | few_genres | genre_clickout;
+          Explorer: NULL.
+        expr: primary_driver
+        data_type: TEXT
+        sample_values:
+          - deep_seenlist
+          - free_content_seeker
+          - large_watchlist
+          - genre_concentrated
+          - long_sessions
+
+      - name: top_genre
+        synonyms:
+          - favorite genre
+          - preferred genre
+          - primary genre
+          - genre preference
+        description: >
+          The content genre the user engages with most (e.g. Drama, Action,
+          Comedy, Thriller, Horror, Science Fiction).
+        expr: top_genre
+        data_type: TEXT
+
+      - name: second_genre
+        synonyms:
+          - secondary genre
+          - second favorite genre
+        description: The user's second most-engaged content genre.
+        expr: second_genre
+        data_type: TEXT
+
+      - name: has_clickout
+        synonyms:
+          - clicked out
+          - has purchase intent
+          - has streaming intent
+          - clicked to provider
+        description: >
+          1 if the user clicked out to any streaming provider at least once,
+          0 otherwise. Only 50% of active users (5+ events) have any clickout.
+          A critical first-order split: Deal Hunters are exclusively has_clickout=1.
+        expr: CAST(has_clickout AS TEXT)
+        data_type: TEXT
+        sample_values:
+          - '1'
+          - '0'
+
+    measures:
+      - name: user_count
+        synonyms:
+          - number of users
+          - total users
+          - audience size
+          - how many users
+        description: Total number of distinct users.
+        expr: COUNT(DISTINCT user_id)
+        data_type: NUMBER
+        default_aggregation: sum
+
+      - name: avg_binge_score
+        synonyms:
+          - binge likelihood
+          - binge probability
+        description: >
+          Average multi-label Binge Watcher score (0–1).
+          Driven by seenlist depth, events per session, login rate, show ratio.
+        expr: binge_score
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_premium_score
+        synonyms:
+          - premium buyer likelihood
+          - TVOD intent score
+          - willingness to pay premium
+        description: >
+          Average Premium Buyer score (0–1). New in v5.
+          Only non-zero for users with has_clickout=1 AND buyer_ratio >= 0.30.
+          Driven by buyer_ratio (0.60 weight), clickout_ratio (0.25), inverted free_ratio (0.15).
+          Premium Buyers: avg buyer_ratio=79%, avg free_ratio=12% — opposite of Deal Hunter.
+        expr: premium_score
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_deal_score
+        synonyms:
+          - deal hunter likelihood
+          - purchase intent score
+          - savvy streamer likelihood
+        description: >
+          Average multi-label Deal Hunter score (0–1).
+          Only non-zero for users with clickouts. Driven by free_ratio and clickout_ratio.
+          Deal Hunters (Savvy Streamers): avg free_ratio=77%, seek free/AVOD content.
+        expr: deal_score
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_trailer_score
+        synonyms:
+          - trailer scout likelihood
+          - research phase score
+          - consideration stage
+        description: >
+          Average Trailer Scout score (0–1). New in v5.
+          Only non-zero for users with trailer_plays >= 3 AND seenlist_adds = 0.
+          Driven by trailer_n (0.55), titles_n (0.30), inverted seenlist (0.15).
+          Trailer Scouts: avg 4.6 trailers, 77% movie-focused, 0% seenlist — research-phase users.
+        expr: trailer_score
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_hoarder_score
+        synonyms:
+          - watchlist hoarder likelihood
+          - hoarding score
+        description: >
+          Average multi-label Watchlist Hoarder score (0–1).
+          Driven by watchlist accumulation relative to actual consumption.
+        expr: hoarder_score
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_loyalist_score
+        synonyms:
+          - genre loyalist likelihood
+          - genre loyalty score
+        description: >
+          Average multi-label Genre Loyalist score (0–1).
+          Only non-zero for users with genre_count >= 3 AND top2_genre_share >= 0.70.
+        expr: loyalist_score
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_clickout_ratio
+        synonyms:
+          - clickout rate
+          - purchase intent rate
+          - conversion rate
+        description: >
+          Average ratio of clickout events to total events.
+          Meaningful only for the 50% of users who have any clickout.
+          Deal Hunters average 0.22.
+        expr: clickout_ratio
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_free_ratio
+        synonyms:
+          - free content preference
+          - ad-supported preference
+          - AVOD preference
+          - free clickout rate
+        description: >
+          Average share of clickouts going to free or ad-supported offers (among clickers).
+          Deal Hunters average 0.76 — strongest segment discriminator (eta²=0.32).
+        expr: free_ratio
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_buyer_ratio
+        synonyms:
+          - willingness to pay
+          - transactional rate
+          - rent or buy rate
+          - TVOD intent
+        description: >
+          Average share of clickouts going to rent or buy offers (among clickers).
+          High values indicate TVOD intent. Only meaningful for has_clickout=1 users.
+        expr: buyer_ratio
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_monetization_diversity
+        synonyms:
+          - offer type variety
+          - multi-monetization
+          - monetization breadth
+        description: >
+          Average number of distinct monetization types used (flatrate/free/ads/rent/buy).
+          0 for non-clickers. 2+ indicates multi-monetization Deal Hunters
+          (the most commercially valuable sub-group: 3x higher engagement).
+        expr: monetization_diversity
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_seenlist_adds
+        synonyms:
+          - watched count
+          - content consumed
+          - titles watched
+          - seen titles
+        description: >
+          Average number of titles marked as seen per user.
+          Strongest CV signal (9.09). Binge Watchers average 26+.
+        expr: seenlist_adds
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_watchlist_adds
+        synonyms:
+          - watchlist additions
+          - titles saved
+          - content saved
+          - watchlist size
+        description: >
+          Average number of titles added to watchlist per user.
+          Second strongest CV (6.90). Watchlist Hoarders average 14+.
+        expr: watchlist_adds
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_events_per_session
+        synonyms:
+          - session depth
+          - engagement depth
+          - session length
+          - browsing intensity
+        description: >
+          Average number of events per user session.
+          Binge Watchers average 47+. Higher values indicate deeper engagement.
+        expr: events_per_session
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_top2_genre_share
+        synonyms:
+          - genre concentration
+          - genre loyalty
+          - top 2 genre focus
+        description: >
+          Average combined share of activity in the user's top 2 genres.
+          1.0 means 100% of activity in two genres.
+          Genre Loyalists have top2_genre_share >= 0.70 AND genre_count >= 3.
+        expr: top2_genre_share
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_unique_titles
+        synonyms:
+          - content breadth
+          - title diversity
+          - number of titles explored
+        description: Average number of distinct titles a user engaged with.
+        expr: unique_titles
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_holiday_ratio
+        synonyms:
+          - holiday viewing share
+          - Christmas activity
+          - seasonal activity
+        description: >
+          Average share of activity during Dec 20-31 (Christmas + NYE window).
+          Holiday Viewers have holiday_ratio > 0.40.
+          High for the entire dataset since T1 covers Dec 2025.
+        expr: holiday_ratio
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_weekend_ratio
+        synonyms:
+          - weekend viewing share
+          - weekend activity
+        description: >
+          Average share of activity on weekends (Sat/Sun).
+          Weekend Warriors have weekend_ratio > 0.55.
+        expr: weekend_ratio
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: avg_evening_ratio
+        synonyms:
+          - evening viewing share
+          - prime time activity
+          - 18-22h activity
+        description: >
+          Average share of activity between 18:00 and 22:00.
+          Evening Browsers have evening_ratio > 0.60.
+        expr: evening_ratio
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: pct_has_clickout
+        synonyms:
+          - clickout penetration
+          - provider click rate
+          - share with purchase intent
+        description: >
+          Percentage of users in the segment who clicked out to any provider.
+          Deal Hunters: 100%. Named segments overall: ~40-67%.
+          Only 50% of active users in total have any clickout.
+        expr: CAST(has_clickout AS FLOAT) * 100
+        data_type: FLOAT
+        default_aggregation: avg
+
+verified_queries:
+  - name: users_per_segment
+    question: How many users are in each segment?
+    sql: >
+      SELECT primary_segment, COUNT(DISTINCT user_id) AS user_count,
+             ROUND(COUNT(*)*100.0/SUM(COUNT(*)) OVER (), 1) AS pct_of_total
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      GROUP BY primary_segment
+      ORDER BY user_count DESC
+
+  - name: segment_overview
+    question: Give me a full overview of all segments with key metrics.
+    sql: >
+      SELECT primary_segment,
+             COUNT(*) AS users,
+             ROUND(COUNT(*)*100.0/SUM(COUNT(*)) OVER (), 1) AS pct_of_total,
+             ROUND(AVG(seenlist_adds), 1) AS avg_seenlist,
+             ROUND(AVG(watchlist_adds), 1) AS avg_watchlist,
+             ROUND(AVG(events_per_session), 1) AS avg_eps,
+             ROUND(AVG(CAST(has_clickout AS FLOAT))*100, 1) AS pct_clickout,
+             ROUND(AVG(COALESCE(free_ratio,0))*100, 1) AS avg_free_pct,
+             ROUND(AVG(top2_genre_share)*100, 1) AS avg_top2_genre_pct
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      GROUP BY primary_segment
+      ORDER BY users DESC
+
+  - name: highest_free_preference_segment
+    question: Which segment prefers free or ad-supported streaming?
+    sql: >
+      SELECT primary_segment,
+             ROUND(AVG(COALESCE(free_ratio,0)), 4) AS avg_free_ratio,
+             ROUND(AVG(CAST(has_clickout AS FLOAT))*100, 1) AS pct_has_clickout,
+             COUNT(*) AS users
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      GROUP BY primary_segment
+      ORDER BY avg_free_ratio DESC
+
+  - name: genre_loyalist_top_genres
+    question: What are the top genres for Genre Loyalists?
+    sql: >
+      SELECT top_genre, COUNT(*) AS users
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      WHERE primary_segment = 'Genre Loyalist'
+        AND top_genre IS NOT NULL
+      GROUP BY top_genre
+      ORDER BY users DESC
+      LIMIT 10
+
+  - name: best_segment_for_thriller
+    question: For a new thriller launch, which segment should I target?
+    sql: >
+      SELECT primary_segment, top_genre, COUNT(*) AS users,
+             ROUND(AVG(COALESCE(free_ratio,0)), 4) AS avg_free_ratio,
+             ROUND(AVG(CAST(has_clickout AS FLOAT))*100, 1) AS pct_has_clickout
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      WHERE top_genre IN ('Thriller', 'Crime', 'Action', 'Mystery')
+      GROUP BY primary_segment, top_genre
+      ORDER BY users DESC
+      LIMIT 15
+
+  - name: highest_pay_intent_segment
+    question: Which segments are most likely to pay to rent or buy content?
+    sql: >
+      SELECT primary_segment,
+             ROUND(AVG(COALESCE(buyer_ratio,0)), 4) AS avg_buyer_ratio,
+             ROUND(AVG(clickout_ratio), 4) AS avg_clickout_ratio,
+             COUNT(*) AS users
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      GROUP BY primary_segment
+      ORDER BY avg_buyer_ratio DESC
+
+  - name: segment_overlap
+    question: Which segments have the most overlap (dual-segment users)?
+    sql: >
+      SELECT primary_segment, secondary_segment,
+             COUNT(*) AS users
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      WHERE secondary_segment IS NOT NULL
+      GROUP BY primary_segment, secondary_segment
+      ORDER BY users DESC
+
+  - name: avod_vs_tvod_by_segment
+    question: Which segments prefer AVOD vs TVOD?
+    sql: >
+      SELECT primary_segment,
+             ROUND(AVG(COALESCE(free_ratio,0))*100, 1) AS avg_free_pct,
+             ROUND(AVG(COALESCE(buyer_ratio,0))*100, 1) AS avg_buyer_pct,
+             ROUND(AVG(CAST(has_clickout AS FLOAT))*100, 1) AS pct_any_clickout,
+             COUNT(*) AS users
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      GROUP BY primary_segment
+      ORDER BY avg_free_pct DESC
+
+  - name: primary_driver_breakdown
+    question: What features are driving segment assignments?
+    sql: >
+      SELECT primary_segment, primary_driver,
+             COUNT(*) AS users,
+             ROUND(COUNT(*)*100.0/SUM(COUNT(*)) OVER (PARTITION BY primary_segment), 1) AS pct_within_segment
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      WHERE primary_driver IS NOT NULL
+      GROUP BY primary_segment, primary_driver
+      ORDER BY primary_segment, users DESC
+
+  - name: dual_segment_users
+    question: How many users belong to two segments at once?
+    sql: >
+      SELECT COUNT(*) AS dual_segment_users,
+             ROUND(COUNT(*)*100.0/(SELECT COUNT(*) FROM DB_TEAM_2.BASE_MARTS.user_segments_v5), 1) AS pct_of_total
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      WHERE secondary_segment IS NOT NULL
+
+  - name: trailer_scout_profile
+    question: Who are the Trailer Scout users and what content do they research?
+    sql: >
+      SELECT
+             ROUND(AVG(CAST(trailer_plays AS FLOAT)), 1)           AS avg_trailer_plays,
+             ROUND(AVG(CAST(unique_titles AS FLOAT)), 1)           AS avg_titles_browsed,
+             ROUND(AVG(CAST(movie_ratio AS FLOAT))*100, 1)         AS avg_movie_pct,
+             ROUND(AVG(CAST(clickout_ratio AS FLOAT))*100, 1)      AS avg_clickout_pct,
+             ROUND(AVG(CAST(has_clickout AS FLOAT))*100, 1)        AS pct_any_clickout,
+             ROUND(AVG(CAST(evening_ratio AS FLOAT))*100, 1)       AS avg_evening_pct,
+             ROUND(AVG(CAST(weekend_ratio AS FLOAT))*100, 1)       AS avg_weekend_pct,
+             COUNT(*)                                              AS user_count
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      WHERE primary_segment = 'Trailer Scout'
+
+  - name: premium_buyer_profile
+    question: Who are Premium Buyers and how do they differ from Deal Hunters?
+    sql: >
+      SELECT primary_segment,
+             ROUND(AVG(CAST(buyer_ratio AS FLOAT))*100, 1)         AS avg_buy_pct,
+             ROUND(AVG(COALESCE(free_ratio,0))*100, 1)             AS avg_free_pct,
+             ROUND(AVG(CAST(clickout_ratio AS FLOAT))*100, 1)      AS avg_clickout_pct,
+             ROUND(AVG(CAST(monetization_diversity AS FLOAT)), 2)  AS avg_mon_diversity,
+             ROUND(AVG(CAST(seenlist_adds AS FLOAT)), 1)           AS avg_seenlist,
+             COUNT(*)                                              AS users
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      WHERE primary_segment IN ('Premium Buyer', 'Deal Hunter')
+      GROUP BY primary_segment
+      ORDER BY avg_buy_pct DESC
+
+  - name: best_segment_for_tvod_launch
+    question: Which segment should I target for a new TVOD movie launch?
+    sql: >
+      SELECT primary_segment,
+             COUNT(*) AS users,
+             ROUND(AVG(CAST(buyer_ratio AS FLOAT))*100, 1)        AS avg_buy_pct,
+             ROUND(AVG(CAST(has_clickout AS FLOAT))*100, 1)       AS pct_clickout,
+             ROUND(AVG(CAST(movie_ratio AS FLOAT))*100, 1)        AS avg_movie_pct,
+             ROUND(AVG(CAST(trailer_plays AS FLOAT)), 1)          AS avg_trailers
+      FROM DB_TEAM_2.BASE_MARTS.user_segments_v5
+      WHERE primary_segment != 'Explorer'
+      GROUP BY primary_segment
+      ORDER BY avg_buy_pct DESC
