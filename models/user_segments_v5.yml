@@ -1,0 +1,457 @@
+version: 2
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sources
+# ──────────────────────────────────────────────────────────────────────────────
+sources:
+  - name: base_base
+    database: DB_TEAM_2
+    schema: BASE_BASE
+    description: >
+      Pre-engineered feature layer for the JustWatch Germany audience.
+      Derived from raw Snowplow event data (T1 / T4 event tables) and
+      materialised as persistent tables for reuse across segment models.
+    tables:
+      - name: user_features_v2
+        description: >
+          One row per user. Contains all behavioural, monetisation, temporal,
+          and device signals aggregated from raw events. Built by
+          build_features_v2.py using the T1 event table (Germany, Dec 2025).
+        columns:
+          - name: user_id
+            description: Anonymous user identifier (grain).
+            tests: [not_null, unique]
+          - name: seenlist_adds
+            description: Total seenlist_add events fired by the user.
+          - name: watchlist_adds
+            description: Total watchlist_add events fired by the user.
+          - name: trailer_plays
+            description: Total youtube_started (trailer) events fired by the user.
+          - name: unique_titles
+            description: Count of distinct jwEntityId values the user interacted with.
+          - name: active_days
+            description: Count of distinct calendar dates with at least one event.
+          - name: events_per_session
+            description: Total events divided by total sessions.
+          - name: avg_session_mins
+            description: Average session duration in minutes (NULL when unavailable).
+          - name: has_clickout
+            description: "1 if the user fired at least one clickout event, else 0."
+          - name: clickout_ratio
+            description: >
+              Fraction of sessions that contained at least one clickout event.
+              clickout_sessions / total_sessions.
+          - name: free_ratio
+            description: >
+              Fraction of clickout events with se_action IN ('free', 'ads').
+              NULL when has_clickout = 0.
+          - name: buyer_ratio
+            description: >
+              Fraction of clickout events with se_action IN ('rent', 'buy').
+              NULL when has_clickout = 0.
+          - name: monetization_diversity
+            description: >
+              Count of distinct clickout se_action values (0–6).
+              0 = no clickouts; 1 = single monetisation type; 2+ = mixed.
+          - name: login_rate
+            description: >
+              Fraction of sessions where login_id was non-NULL.
+              Proxy for persistent account engagement.
+          - name: completion_ratio
+            description: >
+              Ratio of content items the user fully engaged with vs. started.
+              High value → finishes what they start; low value → grazes.
+          - name: show_ratio
+            description: Fraction of content events on show / series titles.
+          - name: movie_ratio
+            description: Fraction of content events on movie titles.
+          - name: weekend_ratio
+            description: Fraction of events that occurred on a Saturday or Sunday.
+          - name: evening_ratio
+            description: Fraction of events fired between 18:00 and 23:59 local hour.
+          - name: holiday_ratio
+            description: Fraction of events that fell on a public holiday.
+          - name: mobile_ratio
+            description: >
+              Fraction of events where cc_yauaa:deviceClass = 'Phone'.
+          - name: page_view_ratio
+            description: Fraction of events where event = 'page_view'.
+          - name: hoard_ratio
+            description: >
+              Ratio of watchlist_adds to seenlist_adds.
+              High → user saves more than they watch (hoarder signal).
+
+      - name: user_genre_profile
+        description: >
+          One row per user. Derived from joining events to OBJECTS and
+          flattening genre_tmdb. Stores the user's top-2 genre preferences
+          and concentration metrics.
+        columns:
+          - name: user_id
+            description: Joins to user_features_v2.user_id.
+            tests: [not_null, unique]
+          - name: top_genre
+            description: Genre with the highest event count for this user.
+          - name: second_genre
+            description: Genre with the second-highest event count.
+          - name: top_genre_share
+            description: Fraction of genre-tagged events belonging to top_genre.
+          - name: second_genre_share
+            description: Fraction of genre-tagged events belonging to second_genre.
+          - name: genre_diversity
+            description: Count of distinct genres the user interacted with.
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model
+# ──────────────────────────────────────────────────────────────────────────────
+models:
+  - name: user_segments_v5
+    description: >
+      Behavioural audience segmentation model — version 5.
+      One row per user. Assigns every user to exactly one primary segment
+      (and optionally a secondary segment) based on six weighted score
+      functions applied to normalised behavioural features.
+
+      **Segmentation philosophy**
+      Features are min-max normalised to a [0, 1] range using robust
+      population percentiles (p1/p99 for zero-inflated count features,
+      p5/p95 for continuous ratio features) so that individual scores are
+      comparable across dimensions. Segment scores are weighted sums of
+      these normalised features. Hard gates zero out physically impossible
+      segment memberships before assignment.
+
+      **Segment priority for ties**
+      Binge Watcher > Premium Buyer > Deal Hunter >
+      Watchlist Hoarder > Genre Loyalist > Trailer Scout > Explorer.
+
+      **Sources**
+      - DB_TEAM_2.BASE_BASE.user_features_v2
+      - DB_TEAM_2.BASE_BASE.user_genre_profile
+
+      **Build script**
+      build_segments_v5.py (Snowflake Python connector, warehouse WH_TEAM_2_XS)
+
+    config:
+      materialized: table
+      database: DB_TEAM_2
+      schema: BASE_MARTS
+
+    meta:
+      owner: team_2
+      domain: audience_segmentation
+      version: 5
+      grain: user_id
+      population: Germany (geo_country = 'DE'), Dec 2025
+      row_count_approx: 110000
+
+    tests:
+      - dbt_utils.expression_is_true:
+          expression: "max_score >= 0 and max_score <= 1"
+          name: max_score_between_0_and_1
+
+    columns:
+
+      # ── Identity ─────────────────────────────────────────────────────────
+      - name: user_id
+        description: >
+          Anonymous user identifier. Grain of the table — one row per user.
+          Carried through unchanged from user_features_v2.
+        tests:
+          - not_null
+          - unique
+
+      # ── Segment scores ────────────────────────────────────────────────────
+      - name: binge_score
+        description: >
+          **Binge Watcher** composite score [0, 1].
+
+          Formula:
+            0.40 × seenlist_n
+          + 0.35 × eps_n
+          + 0.15 × login_n
+          + 0.10 × show_ratio
+
+          - seenlist_n   = log1p(seenlist_adds) normalised to [p1, p99]
+          - eps_n        = events_per_session normalised to [p5, p95]
+          - login_n      = login_rate normalised to [p5, p95]
+          - show_ratio   = raw fraction (no extra normalisation)
+
+          High scores signal deep, logged-in, show-focused consumption.
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "binge_score >= 0 and binge_score <= 1"
+
+      - name: premium_score
+        description: >
+          **Premium Buyer** composite score [0, 1].
+
+          Hard gate: score forced to 0.0 when
+            has_clickout = 0  OR  buyer_ratio < 0.30
+
+          Otherwise:
+            0.60 × buyer_n
+          + 0.25 × cor_n
+          + 0.15 × free_inv_n
+
+          - buyer_n     = buyer_ratio normalised to [p5, p95]
+          - cor_n       = clickout_ratio normalised to [p5, p95]
+          - free_inv_n  = 1 − free_n  (inverted: premium buyers avoid free content)
+
+          Typical premium buyer: buyer_ratio ≈ 0.80, free_ratio ≈ 0.11.
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "premium_score >= 0 and premium_score <= 1"
+
+      - name: deal_score
+        description: >
+          **Deal Hunter** composite score [0, 1].
+
+          The base score is scaled by a monetisation diversity multiplier:
+            multiplier = CASE monetization_diversity
+                           WHEN 0 THEN 0.10
+                           WHEN 1 THEN 0.60
+                           ELSE       1.00
+                         END
+
+          Base score:
+            0.40 × free_n
+          + 0.35 × cor_n
+          + 0.25 × buyer_n
+
+          Users who explore multiple offer types (flatrate + free + rental)
+          score highest. Users with zero clickouts are soft-penalised.
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "deal_score >= 0 and deal_score <= 1"
+
+      - name: hoarder_score
+        description: >
+          **Watchlist Hoarder** composite score [0, 1].
+
+          Formula:
+            0.45 × watchlist_n
+          + 0.25 × login_n
+          + 0.20 × seenlist_inv_n
+          + 0.10 × compl_inv_n
+
+          - watchlist_n    = log1p(watchlist_adds) normalised to [p1, p99]
+          - login_n        = login_rate normalised to [p5, p95]
+          - seenlist_inv_n = 1 − seenlist_n  (inverted: hoarders don't consume)
+          - compl_inv_n    = 1 − LEAST(completion_ratio, 1)
+                             (inverted: low completion → high hoarder signal)
+
+          High scores signal users who aggressively add to watchlist but
+          rarely follow through to watch.
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "hoarder_score >= 0 and hoarder_score <= 1"
+
+      - name: loyalist_score
+        description: >
+          **Genre Loyalist** composite score [0, 1].
+
+          Hard gate: score forced to 0.0 when
+            genre_count < 3  OR  top2_genre_share < 0.70
+
+          Otherwise:
+            0.55 × tgs_n
+          + 0.30 × gc_inv_n
+          + 0.15 × cor_n
+
+          - tgs_n    = top2_genre_share normalised to [p5, p95]
+          - gc_inv_n = 1 − (genre_count normalised to [p5, p95])
+                       (inverted: fewer genres → higher loyalty)
+          - cor_n    = clickout_ratio normalised to [p5, p95]
+
+          The gate ensures a minimum genre diversity before declaring loyalty,
+          preventing single-title users from scoring highly.
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "loyalist_score >= 0 and loyalist_score <= 1"
+
+      - name: trailer_score
+        description: >
+          **Trailer Scout** composite score [0, 1].
+
+          Hard gate: score forced to 0.0 when
+            trailer_plays < 3  OR  seenlist_adds > 0
+
+          Otherwise:
+            0.55 × trailer_n
+          + 0.30 × titles_n
+          + 0.15 × seenlist_inv_n
+
+          - trailer_n     = log1p(trailer_plays) normalised to [p1, p99]
+          - titles_n      = log1p(unique_titles) normalised to [p1, p99]
+          - seenlist_inv_n = 1 − seenlist_n
+
+          Captures research-phase users: heavy trailer viewers who have not
+          yet committed to any content (seenlist = 0).
+          CV of trailer_plays = 2.90 — the highest discriminating raw feature.
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "trailer_score >= 0 and trailer_score <= 1"
+
+      - name: max_score
+        description: >
+          Maximum of all six segment scores:
+          GREATEST(binge_score, premium_score, deal_score,
+                   hoarder_score, loyalist_score, trailer_score).
+
+          Used as the confidence threshold input: if max_score < 0.40
+          the user is classified as Explorer.
+        tests:
+          - not_null
+
+      # ── Segment labels ────────────────────────────────────────────────────
+      - name: primary_segment
+        description: >
+          Final audience segment label. One of:
+
+          | Label             | Condition                                       |
+          |-------------------|-------------------------------------------------|
+          | Explorer          | max_score < 0.40 (no strong signal)             |
+          | Binge Watcher     | binge_score = max_score ≥ 0.40                  |
+          | Premium Buyer     | premium_score = max_score ≥ 0.40                |
+          | Deal Hunter       | deal_score = max_score ≥ 0.40                   |
+          | Watchlist Hoarder | hoarder_score = max_score ≥ 0.40                |
+          | Genre Loyalist    | loyalist_score = max_score ≥ 0.40               |
+          | Trailer Scout     | trailer_score = max_score ≥ 0.40                |
+
+          Ties resolved in the order listed above.
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - Explorer
+                - Binge Watcher
+                - Premium Buyer
+                - Deal Hunter
+                - Watchlist Hoarder
+                - Genre Loyalist
+                - Trailer Scout
+
+      - name: secondary_segment
+        description: >
+          Second-best segment label, or NULL.
+
+          Assigned when all of the following hold:
+            1. primary_segment ≠ 'Explorer'
+            2. second_best_score ≥ 0.30
+            3. max_score − second_best_score ≤ 0.15
+
+          Enables dual-segment targeting (e.g. "Binge Watcher / Deal Hunter").
+
+      - name: primary_driver
+        description: >
+          The single sub-component that contributed most to the
+          primary segment score. Used to explain *why* a user was
+          placed in their segment.
+
+          Example values by segment:
+          - Binge Watcher   : deep_seenlist | long_sessions | logged_in | show_focus
+          - Premium Buyer   : tvod_buyer | high_clickout | avoids_free
+          - Deal Hunter     : free_content_seeker | high_clickout | tvod_buyer
+          - Watchlist Hoarder: large_watchlist | logged_in_hoarder | low_consumption | low_completion
+          - Genre Loyalist  : genre_concentrated | few_genres | genre_clickout
+          - Trailer Scout   : heavy_trailer_viewer | broad_discovery | non_consumer
+          - Explorer        : NULL
+
+      # ── Normalised features (pass-through) ───────────────────────────────
+      - name: seenlist_n
+        description: log1p(seenlist_adds) min-max scaled to [0,1] using population p1/p99.
+      - name: watchlist_n
+        description: log1p(watchlist_adds) min-max scaled to [0,1] using population p1/p99.
+      - name: eps_n
+        description: events_per_session min-max scaled to [0,1] using population p5/p95.
+      - name: login_n
+        description: login_rate min-max scaled to [0,1] using population p5/p95.
+      - name: free_n
+        description: free_ratio min-max scaled to [0,1] using population p5/p95.
+      - name: cor_n
+        description: clickout_ratio min-max scaled to [0,1] using population p5/p95.
+      - name: buyer_n
+        description: buyer_ratio min-max scaled to [0,1] using population p5/p95.
+      - name: trailer_n
+        description: log1p(trailer_plays) min-max scaled to [0,1] using population p1/p99.
+      - name: titles_n
+        description: log1p(unique_titles) min-max scaled to [0,1] using population p1/p99.
+      - name: tgs_n
+        description: top2_genre_share min-max scaled to [0,1] using population p5/p95.
+      - name: gc_inv_n
+        description: >
+          1 − (genre_count normalised to p5/p95).
+          Inverted so that fewer genres → higher value (loyalty signal).
+      - name: seenlist_inv_n
+        description: >
+          1 − seenlist_n.
+          Inverted seenlist signal used by Watchlist Hoarder and Trailer Scout.
+      - name: compl_inv_n
+        description: >
+          1 − LEAST(GREATEST(completion_ratio, 0), 1).
+          Inverted completion ratio — low follow-through raises the hoarder score.
+      - name: free_inv_n
+        description: >
+          1 − free_n.
+          Inverted free-content propensity used by Premium Buyer scoring.
+
+      # ── Raw features (pass-through) ──────────────────────────────────────
+      - name: weekend_ratio
+        description: Fraction of events on weekends (Sat/Sun).
+      - name: evening_ratio
+        description: Fraction of events between 18:00–23:59.
+      - name: holiday_ratio
+        description: Fraction of events on public holidays.
+      - name: trailer_plays
+        description: Raw count of youtube_started events.
+      - name: mobile_ratio
+        description: Fraction of events on mobile (Phone deviceClass).
+      - name: login_rate
+        description: Fraction of sessions with an authenticated login_id.
+      - name: page_view_ratio
+        description: Fraction of total events that were page_view type.
+      - name: clickout_ratio
+        description: Fraction of sessions containing a clickout event.
+      - name: events_per_session
+        description: Average events per session (total_events / session_count).
+      - name: avg_session_mins
+        description: Average session duration in minutes (0 when unavailable).
+      - name: top2_genre_share
+        description: Combined share of top-2 genres in the user's event history.
+      - name: genre_count
+        description: Count of distinct genres in the user's event history.
+      - name: top_genre
+        description: User's most-watched genre by event count.
+      - name: second_genre
+        description: User's second-most-watched genre by event count.
+      - name: seenlist_adds
+        description: Raw count of seenlist_add events.
+      - name: watchlist_adds
+        description: Raw count of watchlist_add events.
+      - name: active_days
+        description: Count of distinct calendar dates with activity.
+      - name: unique_titles
+        description: Count of distinct content titles interacted with.
+      - name: buyer_ratio
+        description: >
+          Fraction of clickout events for rent/buy offers (0.0 when no clickouts).
+      - name: free_ratio
+        description: >
+          Fraction of clickout events for free/ads offers (0.0 when no clickouts).
+      - name: has_clickout
+        description: "Binary flag: 1 if any clickout event exists, else 0."
+      - name: monetization_diversity
+        description: >
+          Count of distinct clickout offer types (flatrate, free, rent, buy, …).
+          Range 0–6.
+      - name: completion_ratio
+        description: >
+          Ratio of fully completed content interactions vs. started.
+          0 = never finishes; 1 = always finishes.
+      - name: hoard_ratio
+        description: watchlist_adds / seenlist_adds. High → saves more than watches.
+      - name: show_ratio
+        description: Fraction of content events on show/series titles.
+      - name: movie_ratio
+        description: Fraction of content events on movie titles.
