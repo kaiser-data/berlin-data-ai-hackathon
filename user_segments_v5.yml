@@ -1,0 +1,111 @@
+version: 2
+
+models:
+  - name: user_segments_v5
+    description: >
+      Simple v5 audience segmentation model built by
+      [build_segments_v5.sql](/Users/marty/hackathon/berlin-data-ai-hackathon/build_segments_v5.sql).
+      One row per user with six segment scores, the winning score, and the final
+      primary segment label. Inputs come from
+      DB_TEAM_2.BASE_BASE.user_features_v2 and DB_TEAM_2.BASE_BASE.user_genre_profile.
+      Count features are log1p-normalized to the 1st-99th percentile range, rate
+      features are scaled to the 5th-95th percentile range, and segment-specific
+      hard gates zero out invalid segment scores before classification.
+    columns:
+      - name: user_id
+        description: >
+          Unique user identifier carried through from user_features_v2 and used as
+          the grain of the final table. One row is produced per user_id.
+        tests:
+          - not_null
+          - unique
+
+      - name: binge_score
+        description: >
+          Binge Watcher score. Calculated as
+          0.40 * seenlist_n
+          + 0.35 * eps_n
+          + 0.15 * login_n
+          + 0.10 * show_ratio,
+          where seenlist_n is log1p(seenlist_adds) normalized to the global
+          p1-p99 range, eps_n is events_per_session normalized to p5-p95,
+          and login_n is login_rate normalized to p5-p95.
+
+      - name: premium_score
+        description: >
+          Premium Buyer score. Hard-gated to 0 when has_clickout = 0 or
+          buyer_ratio < 0.30. Otherwise calculated as
+          0.60 * buyer_n
+          + 0.25 * cor_n
+          + 0.15 * free_inv_n,
+          where buyer_n is buyer_ratio normalized to p5-p95, cor_n is
+          clickout_ratio normalized to p5-p95, and free_inv_n is
+          1 - free_n.
+
+      - name: deal_score
+        description: >
+          Deal Hunter score. Calculated as a monetization diversity multiplier
+          times the weighted content-price preference score:
+          multiplier =
+          CASE monetization_diversity
+            WHEN 0 THEN 0.10
+            WHEN 1 THEN 0.60
+            ELSE 1.00
+          END
+          and base score =
+          0.40 * free_n
+          + 0.35 * cor_n
+          + 0.25 * buyer_n.
+
+      - name: hoarder_score
+        description: >
+          Watchlist Hoarder score. Calculated as
+          0.45 * watchlist_n
+          + 0.25 * login_n
+          + 0.20 * seenlist_inv_n
+          + 0.10 * compl_inv_n,
+          where watchlist_n is log1p(watchlist_adds) normalized to p1-p99,
+          seenlist_inv_n is 1 - seenlist_n, and compl_inv_n is
+          1 - LEAST(GREATEST(completion_ratio, 0), 1).
+
+      - name: loyalist_score
+        description: >
+          Genre Loyalist score. Hard-gated to 0 when genre_count < 3 or
+          top2_genre_share < 0.70. Otherwise calculated as
+          0.55 * tgs_n
+          + 0.30 * gc_inv_n
+          + 0.15 * cor_n,
+          where tgs_n is top2_genre_share normalized to p5-p95 and gc_inv_n is
+          1 - genre_count normalized to p5-p95.
+
+      - name: trailer_score
+        description: >
+          Trailer Scout score. Hard-gated to 0 when trailer_plays < 3 or
+          seenlist_adds > 0. Otherwise calculated as
+          0.55 * trailer_n
+          + 0.30 * titles_n
+          + 0.15 * seenlist_inv_n,
+          where trailer_n is log1p(trailer_plays) normalized to p1-p99 and
+          titles_n is log1p(unique_titles) normalized to p1-p99.
+
+      - name: max_score
+        description: >
+          Highest named-segment score for the user:
+          GREATEST(
+            binge_score,
+            premium_score,
+            deal_score,
+            hoarder_score,
+            loyalist_score,
+            trailer_score
+          ).
+          This value is used as the classifier confidence threshold input.
+
+      - name: primary_segment
+        description: >
+          Final segment label chosen from the six named segments plus Explorer.
+          Logic:
+          if max_score < 0.40 then Explorer;
+          else assign the segment whose score equals max_score, checked in this
+          order for ties: Binge Watcher, Premium Buyer, Deal Hunter,
+          Watchlist Hoarder, Genre Loyalist, Trailer Scout.
